@@ -135,6 +135,75 @@ fn apply_patches(
     Ok(applied)
 }
 
+/// A build tree prepared for its steps, before the steps run.
+struct PreparedBuild {
+    srcdir: PathBuf,
+    stage: PathBuf,
+    deps: Vec<(String, PathBuf)>,
+    patches: Vec<String>,
+    sandbox_policy: util::SandboxPolicy,
+    creds: Option<(u32, u32)>,
+}
+
+fn prepare_build(
+    recipe: &Recipe,
+    paths: &Paths,
+    dep_stores: &[PathBuf],
+    work: &Path,
+    source: &mut fs::File,
+    log: &mut fs::File,
+) -> Result<PreparedBuild> {
+    validate_writable(recipe)?;
+    validate_read(recipe)?;
+    let deps = dependency_mounts(recipe, dep_stores)?;
+    let build_root = crate::build_container::base(paths)?;
+    let sandbox_policy = sandbox_policy(recipe, work, build_root.as_deref(), &deps);
+    let creds = build_user();
+    // Unpacking and patching write the source tree with the lower privileges.
+    let fs_creds = unpack_user();
+    let srcdir = unpack_source(recipe, source, work, fs_creds, log)?;
+    let patches = apply_patches(recipe, work, &srcdir, fs_creds, log)?;
+    let stage = prepare_stage(work, creds)?;
+    Ok(PreparedBuild {
+        srcdir,
+        stage,
+        deps,
+        patches,
+        sandbox_policy,
+        creds,
+    })
+}
+
+fn execute_build(
+    recipe: &Recipe,
+    prepared: &PreparedBuild,
+    envs: &[(&str, String)],
+    rpath: &[String],
+    log: &mut fs::File,
+) -> Result<()> {
+    run_build_steps(
+        recipe,
+        &prepared.srcdir,
+        &prepared.stage,
+        &recipe.install.prefix,
+        envs,
+        rpath,
+        prepared.creds,
+        &prepared.sandbox_policy,
+        log,
+    )?;
+    if fs::symlink_metadata(&prepared.stage)?
+        .file_type()
+        .is_symlink()
+    {
+        bail!("build stage was replaced by a symlink; refusing to package it");
+    }
+    if let Some((uid, _gid)) = build_user() {
+        util::stop_build_descendants(uid)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build(
     recipe: &Recipe,
@@ -194,58 +263,45 @@ pub fn build(
             &mut log,
         );
     }
-    validate_writable(recipe)?;
-    validate_read(recipe)?;
-    let deps = dependency_mounts(recipe, dep_stores)?;
-    let build_root = crate::build_container::base(paths)?;
-    let sandbox_policy = sandbox_policy(recipe, work.path(), build_root.as_deref(), &deps);
-    let creds = build_user();
-    // Unpacking and patching write the source tree with the lower privileges.
-    let fs_creds = unpack_user();
-    let srcdir = unpack_source(recipe, &mut source, work.path(), fs_creds, &mut log)?;
-    let applied_patches = apply_patches(recipe, work.path(), &srcdir, fs_creds, &mut log)?;
-    let stage = prepare_stage(work.path(), creds)?;
+    let prepared = prepare_build(
+        recipe,
+        paths,
+        dep_stores,
+        work.path(),
+        &mut source,
+        &mut log,
+    )?;
     let mut envs = base_envs(
         recipe,
-        &stage,
-        &srcdir,
+        &prepared.stage,
+        &prepared.srcdir,
         &rpath_entries,
         &planned_store,
         dep_stores,
-        &deps,
+        &prepared.deps,
     );
     let (eff_cflags, eff_rustflags) =
         compiler_envs(recipe, local, &mut envs, scrub_paths, work.path());
     refresh_makeflags(&mut envs, recipe);
-    run_build_steps(
-        recipe,
-        &srcdir,
-        &stage,
-        &recipe.install.prefix,
-        &envs,
-        &rpath_entries,
-        creds,
-        &sandbox_policy,
-        &mut log,
-    )?;
-    if fs::symlink_metadata(&stage)?.file_type().is_symlink() {
-        bail!("build stage was replaced by a symlink; refusing to package it");
-    }
-    if let Some((uid, _gid)) = build_user() {
-        util::stop_build_descendants(uid)?;
-    }
+    execute_build(recipe, &prepared, &envs, &rpath_entries, &mut log)?;
     let mut allowed = vec![planned_store.clone()];
     allowed.extend(dep_stores.iter().cloned());
-    check_scrubbed(&stage, scrub_paths, &scrub_map, &allowed, allow_path_leak)?;
+    check_scrubbed(
+        &prepared.stage,
+        scrub_paths,
+        &scrub_map,
+        &allowed,
+        allow_path_leak,
+    )?;
     seal(
         SealInputs {
             recipe,
-            stage: &stage,
+            stage: &prepared.stage,
             store_path: &planned_store,
             source_sha: &source_sha,
             recipe_sha: &recipe_sha,
             rpath: &rpath_entries,
-            patches: &applied_patches,
+            patches: &prepared.patches,
             cflags: &eff_cflags,
             rustflags: &eff_rustflags,
             log_path: &log_path,

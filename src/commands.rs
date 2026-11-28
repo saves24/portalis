@@ -6,6 +6,8 @@ use crate::recipe;
 use crate::util;
 use crate::BACKUP_RETENTION_DAYS;
 use anyhow::Result;
+
+pub(crate) mod install;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn dir_size(path: &std::path::Path) -> u64 {

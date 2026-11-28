@@ -137,7 +137,7 @@ curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh 
 Для установки конкретной версии передайте её скрипту:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh | sudo sh -s -- 0.1.0
+curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh | sudo sh -s -- 0.1.1
 ```
 
 Установщик размещает двоичный файл в `/usr/lib/portalis/portalis`, создаёт

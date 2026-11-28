@@ -131,7 +131,7 @@ curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh 
 To pin a specific release, pass the version to the script:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh | sudo sh -s -- 0.1.0
+curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh | sudo sh -s -- 0.1.1
 ```
 
 The installer places the binary at `/usr/lib/portalis/portalis`, creates the
@@ -439,11 +439,17 @@ setting produces a different directory.
   transaction would replace before it writes them.
 - Before activation, every manifest path is checked. Undeclared setuid or setgid
   bits and links into protected host locations such as `/home`, `/root`,
-  `/proc`, `/sys`, or `/dev` are refused.
+  `/proc`, `/sys`, or `/dev` are refused. Client configuration under `/etc/ssh`
+  is accepted; `sshd_config` and the standard host keys stay protected. Links
+  into `/etc` are allowed, while writes there remain limited to the paths the
+  sensitive and protected lists name.
 - A package is accepted only when its manifest matches the recipe and the
   archive. With no trusted key configured, an unsigned build is accepted with a
   warning; set `security.require_signature = true` after installing trusted
   keys.
+- `PORTALIS_ALLOW_PROTECTED_PATHS=1` lets an import write to, or link
+  into, a protected host location other than the reserved helper paths; the
+  default refuses them.
 - A signing key must be owned by root and readable only by its owner
   (`chmod 600`); otherwise signing is refused.
 - `security.require_signature` verifies a manifest against trusted keys. The

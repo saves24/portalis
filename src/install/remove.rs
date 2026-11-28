@@ -277,32 +277,67 @@ fn purge_store(
     Ok(store_kept)
 }
 
+/// The directory list a manifest records, when it is readable.
+fn manifest_directories(db: &Db, name: &str) -> Result<Vec<crate::recipe::ManifestDir>> {
+    let Some(canonical) = db.manifest_of(name)? else {
+        return Ok(Vec::new());
+    };
+    match serde_json::from_str::<crate::recipe::BuildManifest>(&canonical) {
+        Ok(manifest) => Ok(manifest.dirs),
+        Err(error) => {
+            eprintln!("warning: manifest for {name} could not be read: {error:#}");
+            Ok(Vec::new())
+        }
+    }
+}
+
+/// The recorded state with this package removed, hashed for the journal.
+fn removal_digest(db: &Db, name: &str) -> Result<String> {
+    let mut target_state = db.current_state()?;
+    target_state.packages.retain(|pkg| pkg.name != name);
+    target_state.files.retain(|file| file.pkg != name);
+    target_state.manifests.retain(|(pkg, _)| pkg != name);
+    target_state.adopted.retain(|(pkg, _, _)| pkg != name);
+    Ok(crate::util::sha256_bytes(&serde_json::to_vec(
+        &target_state,
+    )?))
+}
+
+/// Drops the directories this package created and left empty.
+fn remove_directories(target_root: &Path, directories: &[crate::recipe::ManifestDir]) {
+    for directory in directories.iter().rev() {
+        if crate::policy::is_protected_path(&directory.path) {
+            continue;
+        }
+        if let Err(error) = remove_live_directory(target_root, &directory.path) {
+            eprintln!("warning: {} was not removed: {error:#}", directory.path);
+        }
+    }
+}
+
+/// Records the removal as a generation and prunes old ones.
+fn record_removal(db: &Db, paths: &Paths, name: &str) {
+    if let Err(error) = db.snapshot(&format!("remove {name}")) {
+        eprintln!("warning: {name} was removed, but its generation record failed: {error:#}");
+    }
+    let keep = generations_to_keep(paths);
+    if let Err(error) = db.prune_generations(keep, &protected_generations(paths)) {
+        eprintln!("warning: old generations were not pruned: {error:#}");
+    }
+}
+
 pub fn remove(name: &str, db: &Db, paths: &Paths, purge: bool, force: bool) -> Result<()> {
     let Some((_had_pending, pkg)) = preflight(name, db, paths, purge, force)? else {
         return Ok(());
     };
     let target_root = paths.target_root();
     let files = db.files_of(name)?;
-    let directories = match db.manifest_of(name)? {
-        Some(canonical) => match serde_json::from_str::<crate::recipe::BuildManifest>(&canonical) {
-            Ok(manifest) => manifest.dirs,
-            Err(error) => {
-                eprintln!("warning: manifest for {name} could not be read: {error:#}");
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
+    let directories = manifest_directories(db, name)?;
     refuse_busy(name, &files, paths, force)?;
     // The staged copy is removed with the package row.
     let adopted: std::collections::HashMap<String, String> =
         db.adopted_of(name)?.into_iter().collect();
-    let mut target_state = db.current_state()?;
-    target_state.packages.retain(|pkg| pkg.name != name);
-    target_state.files.retain(|file| file.pkg != name);
-    target_state.manifests.retain(|(pkg, _)| pkg != name);
-    target_state.adopted.retain(|(pkg, _, _)| pkg != name);
-    let target_digest = crate::util::sha256_bytes(&serde_json::to_vec(&target_state)?);
+    let target_digest = removal_digest(db, name)?;
     let marker = super::OperationMarker::start(paths, &format!("remove of {name}"))?;
     let mut record = Some(super::operations::OperationJournal::begin(
         paths,
@@ -350,22 +385,8 @@ pub fn remove(name: &str, db: &Db, paths: &Paths, purge: bool, force: bool) -> R
     if let Err(error) = remove_etc_link(paths, name) {
         eprintln!("warning: the etc link for {name} was not removed: {error:#}");
     }
-    for directory in directories.iter().rev() {
-        if crate::policy::is_protected_path(&directory.path) {
-            continue;
-        }
-        if let Err(error) = remove_live_directory(&target_root, &directory.path) {
-            eprintln!("warning: {} was not removed: {error:#}", directory.path);
-        }
-    }
-    if let Err(error) = db.snapshot(&format!("remove {name}")) {
-        eprintln!("warning: {name} was removed, but its generation record failed: {error:#}");
-    }
-    // Prunes generations after the snapshot.
-    let keep = generations_to_keep(paths);
-    if let Err(error) = db.prune_generations(keep, &protected_generations(paths)) {
-        eprintln!("warning: old generations were not pruned: {error:#}");
-    }
+    remove_directories(&target_root, &directories);
+    record_removal(db, paths, name);
     let store_kept = purge_store(&pkg, db, paths, purge, force)?;
     say!("unlinked {removed} files, kept {kept} (modified or user-owned)");
     if restored > 0 {

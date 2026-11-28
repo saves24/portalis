@@ -90,7 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh 
 安装指定版本时，将版本号作为参数传入：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh | sudo sh -s -- 0.1.0
+curl -fsSL https://raw.githubusercontent.com/saves24/portalis/master/install.sh | sudo sh -s -- 0.1.1
 ```
 
 安装程序将二进制安装到 `/usr/lib/portalis/portalis`，创建 `/usr/bin/moirse` 符号链接，创建运行时目录，并安装用于在关机时应用延迟激活的 `portalis.service` systemd 单元。若以本地二进制路径调用，安装程序接受该二进制；该路径不会下载或验证发布归档。

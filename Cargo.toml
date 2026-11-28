@@ -1,6 +1,6 @@
 [package]
 name = "portalis"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Offline, hash-locked package manager with a Nix-style store"
 license = "MIT"

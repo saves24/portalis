@@ -219,110 +219,127 @@ fn undo(plan: &Entry, target_root: &Path, recreate: bool) -> Result<usize> {
         Ok(true)
     );
     match &plan.previous {
-        Previous::Displaced { backup } => {
-            let backup = Path::new(backup);
-            if !backup.exists() {
-                // a regular file at the live path is the restored one; anything
-                // else cannot be confirmed
-                let restored = fs::symlink_metadata(&live)
-                    .map(|meta| meta.file_type().is_file())
-                    .unwrap_or(false);
-                return if restored {
-                    Ok(0)
-                } else {
-                    Err(crate::error::Coded::new(
-                        crate::error::Code::RecoveryBlocked,
-                        format!(
-                            "{} has neither its backup nor the file it held; the record is kept",
-                            plan.path
-                        ),
-                    )
-                    .into())
-                };
-            }
-            remove_in_live(target_root, &plan.path)
-                .with_context(|| format!("clearing {}", plan.path))?;
-            if backup.is_dir() {
-                crate::links::restore_backup(target_root, &plan.path, backup)
-                    .with_context(|| format!("restoring {} back", plan.path))?;
-            } else {
-                crate::links::copy_into_live(target_root, &plan.path, backup, None)
-                    .with_context(|| format!("copying {} back", plan.path))?;
-                if let Err(error) = fs::remove_file(backup) {
-                    eprintln!(
-                        "warning: {} is back but its backup {} was kept: {error}",
-                        plan.path,
-                        backup.display()
-                    );
-                }
-            }
-            Ok(1)
-        }
-        Previous::Restored { backup } => {
-            let backup = Path::new(backup);
-            let meta = match fs::symlink_metadata(&live) {
-                Ok(meta) => meta,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-                Err(error) => {
-                    return Err(error).with_context(|| format!("reading {}", live.display()));
-                }
-            };
-            if !meta.file_type().is_file() && !meta.file_type().is_dir() {
-                return Err(crate::error::Coded::new(
-                    crate::error::Code::RecoveryBlocked,
-                    format!(
-                        "{} is not the file this record restored; the record is kept",
-                        plan.path
-                    ),
-                )
-                .into());
-            }
-            if backup.exists() {
-                return Err(crate::error::Coded::new(
-                    crate::error::Code::RecoveryBlocked,
-                    format!(
-                        "{} already has a backup; the record is kept",
-                        backup.display()
-                    ),
-                )
-                .into());
-            }
-            if let Some(parent) = backup.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            fs::rename(&live, backup)
-                .with_context(|| format!("putting {} back to {}", plan.path, backup.display()))?;
-            if let Some(parent) = live.parent() {
-                let _ = crate::util::sync_dir(parent);
-            }
-            if let Some(parent) = backup.parent() {
-                let _ = crate::util::sync_dir(parent);
-            }
-            Ok(1)
-        }
+        Previous::Displaced { backup } => undo_displaced(target_root, plan, backup, &live),
+        Previous::Restored { backup } => undo_restored(plan, backup, &live),
         Previous::Symlink { target } => {
-            // the path held a link before, and it goes back pointing where it did
-            if !installed {
-                if recreate && fs::symlink_metadata(&live).is_err() {
-                    crate::links::safe_symlink(target_root, &plan.path, target)?;
-                    return Ok(1);
-                }
-                return Ok(0);
-            }
-            remove_in_live(target_root, &plan.path)
-                .with_context(|| format!("clearing {}", plan.path))?;
-            crate::links::safe_symlink(target_root, &plan.path, target)
-                .with_context(|| format!("pointing {} at {target}", plan.path))?;
-            Ok(1)
+            undo_symlink(target_root, plan, target, &live, installed, recreate)
         }
-        Previous::Missing => {
-            if !installed {
-                return Ok(0);
-            }
-            remove_in_live(target_root, &plan.path)
-                .with_context(|| format!("clearing {}", plan.path))?;
-            Ok(1)
+        Previous::Missing => undo_missing(target_root, plan, installed),
+    }
+}
+
+/// Puts back what a displaced live path held.
+fn undo_displaced(target_root: &Path, plan: &Entry, backup: &str, live: &Path) -> Result<usize> {
+    let backup = Path::new(backup);
+    if !backup.exists() {
+        // a regular file at the live path is the restored one; anything
+        // else cannot be confirmed
+        let restored = fs::symlink_metadata(live)
+            .map(|meta| meta.file_type().is_file())
+            .unwrap_or(false);
+        return if restored {
+            Ok(0)
+        } else {
+            Err(crate::error::Coded::new(
+                crate::error::Code::RecoveryBlocked,
+                format!(
+                    "{} has neither its backup nor the file it held; the record is kept",
+                    plan.path
+                ),
+            )
+            .into())
+        };
+    }
+    remove_in_live(target_root, &plan.path).with_context(|| format!("clearing {}", plan.path))?;
+    if backup.is_dir() {
+        crate::links::restore_backup(target_root, &plan.path, backup)
+            .with_context(|| format!("restoring {} back", plan.path))?;
+    } else {
+        crate::links::copy_into_live(target_root, &plan.path, backup, None)
+            .with_context(|| format!("copying {} back", plan.path))?;
+        if let Err(error) = fs::remove_file(backup) {
+            eprintln!(
+                "warning: {} is back but its backup {} was kept: {error}",
+                plan.path,
+                backup.display()
+            );
         }
     }
+    Ok(1)
+}
+
+/// Puts a restored original back into the backup area.
+fn undo_restored(plan: &Entry, backup: &str, live: &Path) -> Result<usize> {
+    let backup = Path::new(backup);
+    let meta = match fs::symlink_metadata(live) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", live.display()));
+        }
+    };
+    if !meta.file_type().is_file() && !meta.file_type().is_dir() {
+        return Err(crate::error::Coded::new(
+            crate::error::Code::RecoveryBlocked,
+            format!(
+                "{} is not the file this record restored; the record is kept",
+                plan.path
+            ),
+        )
+        .into());
+    }
+    if backup.exists() {
+        return Err(crate::error::Coded::new(
+            crate::error::Code::RecoveryBlocked,
+            format!(
+                "{} already has a backup; the record is kept",
+                backup.display()
+            ),
+        )
+        .into());
+    }
+    if let Some(parent) = backup.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::rename(live, backup)
+        .with_context(|| format!("putting {} back to {}", plan.path, backup.display()))?;
+    if let Some(parent) = live.parent() {
+        let _ = crate::util::sync_dir(parent);
+    }
+    if let Some(parent) = backup.parent() {
+        let _ = crate::util::sync_dir(parent);
+    }
+    Ok(1)
+}
+
+/// Points the path back at the link target the record names.
+fn undo_symlink(
+    target_root: &Path,
+    plan: &Entry,
+    target: &str,
+    live: &Path,
+    installed: bool,
+    recreate: bool,
+) -> Result<usize> {
+    // the path held a link before, and it goes back pointing where it did
+    if !installed {
+        if recreate && fs::symlink_metadata(live).is_err() {
+            crate::links::safe_symlink(target_root, &plan.path, target)?;
+            return Ok(1);
+        }
+        return Ok(0);
+    }
+    remove_in_live(target_root, &plan.path).with_context(|| format!("clearing {}", plan.path))?;
+    crate::links::safe_symlink(target_root, &plan.path, target)
+        .with_context(|| format!("pointing {} at {target}", plan.path))?;
+    Ok(1)
+}
+
+/// Clears a path the record says was absent before.
+fn undo_missing(target_root: &Path, plan: &Entry, installed: bool) -> Result<usize> {
+    if !installed {
+        return Ok(0);
+    }
+    remove_in_live(target_root, &plan.path).with_context(|| format!("clearing {}", plan.path))?;
+    Ok(1)
 }

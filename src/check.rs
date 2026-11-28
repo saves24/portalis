@@ -100,13 +100,14 @@ fn mount_overlay(root: &Path, lower: &Path, upper: &Path, work: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Runs the recipe's check command in a disposable copy of the rootfs.
-pub fn run(
-    recipe: &Recipe,
-    outcome: &BuildOutcome,
-    paths: &Paths,
-    dependencies: &[PathBuf],
-) -> Result<()> {
+/// What the recipe and the manifest say about this check.
+struct CheckPlan {
+    command: String,
+    required: bool,
+    timeout: u64,
+}
+
+fn check_plan(recipe: &Recipe, outcome: &BuildOutcome) -> Result<Option<CheckPlan>> {
     let required = outcome
         .manifest
         .check_required
@@ -124,8 +125,29 @@ pub fn run(
                 recipe.package.version
             );
         }
-        return Ok(());
+        return Ok(None);
     };
+    let timeout = outcome
+        .manifest
+        .check_timeout
+        .or(recipe.check.timeout)
+        .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+    Ok(Some(CheckPlan {
+        command: command.to_string(),
+        required,
+        timeout,
+    }))
+}
+
+/// Builds the disposable root the check runs in, and its bwrap arguments.
+fn prepare_check_root(
+    recipe: &Recipe,
+    outcome: &BuildOutcome,
+    paths: &Paths,
+    dependencies: &[PathBuf],
+    command: &str,
+    required: bool,
+) -> Result<Option<(CheckRoot, Vec<String>)>> {
     let Some(image) = crate::rootfs::prepare(paths)? else {
         if required {
             bail!(
@@ -138,7 +160,7 @@ pub fn run(
             "warning: check skipped for {} {}: this build has no rootfs image",
             recipe.package.name, recipe.package.version
         );
-        return Ok(());
+        return Ok(None);
     };
 
     let root = CheckRoot::new(&image, paths)?;
@@ -166,32 +188,46 @@ pub fn run(
         command,
         &recipe.install.prefix,
     );
+    Ok(Some((root, args)))
+}
+
+fn run_check_command(
+    args: &[String],
+    paths: &Paths,
+    timeout: u64,
+) -> Result<(tempfile::NamedTempFile, Option<std::process::ExitStatus>)> {
     let log = tempfile::Builder::new()
         .prefix("check-log-")
         .tempfile_in(paths.state_dir())
         .context("creating the check log")?;
-    let timeout = outcome
-        .manifest
-        .check_timeout
-        .or(recipe.check.timeout)
-        .unwrap_or(DEFAULT_TIMEOUT_SECONDS);
-    let status = match run_bwrap(&args, log.path(), timeout) {
-        Ok(Some(status)) => status,
-        Ok(None) => {
-            if required {
-                bail!(
-                    "check for {} {} did not finish within {timeout}s",
-                    recipe.package.name,
-                    recipe.package.version
-                );
-            }
-            eprintln!(
-                "warning: check skipped for {} {}: it did not finish within {timeout}s",
-                recipe.package.name, recipe.package.version
-            );
-            return Ok(());
-        }
-        Err(error) if !required => {
+    let status = run_bwrap(args, log.path(), timeout)?;
+    Ok((log, status))
+}
+
+/// Runs the recipe's check command in a disposable copy of the rootfs.
+pub fn run(
+    recipe: &Recipe,
+    outcome: &BuildOutcome,
+    paths: &Paths,
+    dependencies: &[PathBuf],
+) -> Result<()> {
+    let Some(plan) = check_plan(recipe, outcome)? else {
+        return Ok(());
+    };
+    let Some((_root, args)) = prepare_check_root(
+        recipe,
+        outcome,
+        paths,
+        dependencies,
+        &plan.command,
+        plan.required,
+    )?
+    else {
+        return Ok(());
+    };
+    let (log, status) = match run_check_command(&args, paths, plan.timeout) {
+        Ok(result) => result,
+        Err(error) if !plan.required => {
             eprintln!(
                 "warning: check skipped for {} {}: {error:#}",
                 recipe.package.name, recipe.package.version
@@ -200,13 +236,28 @@ pub fn run(
         }
         Err(error) => return Err(error),
     };
+    let Some(status) = status else {
+        if plan.required {
+            bail!(
+                "check for {} {} did not finish within {}s",
+                recipe.package.name,
+                recipe.package.version,
+                plan.timeout
+            );
+        }
+        eprintln!(
+            "warning: check skipped for {} {}: it did not finish within {}s",
+            recipe.package.name, recipe.package.version, plan.timeout
+        );
+        return Ok(());
+    };
     let output = read_output(log.path())?;
     if !status.success() {
         let message = format!(
             "check failed for {} {} ({}):\n{}",
             recipe.package.name, recipe.package.version, status, output
         );
-        if required {
+        if plan.required {
             bail!("{message}");
         }
         eprintln!("warning: {message}");

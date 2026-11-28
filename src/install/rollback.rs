@@ -181,12 +181,20 @@ pub(super) fn recover_adopted(db: &Db, paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-pub fn rollback(id: i64, db: &mut Db, paths: &Paths) -> Result<()> {
+/// Reads the generation this rollback targets and refuses a busy tree.
+fn validate_rollback(
+    db: &Db,
+    paths: &Paths,
+    id: i64,
+) -> Result<(
+    crate::db::State,
+    std::collections::BTreeMap<String, String>,
+    Vec<crate::db::FileRow>,
+)> {
     let state = match db.state_of(id)? {
         Some(s) => s,
         None => bail!("generation not found: {id}"),
     };
-    let target_root = paths.target_root();
     let desired: std::collections::BTreeMap<String, String> = state
         .files
         .iter()
@@ -194,35 +202,12 @@ pub fn rollback(id: i64, db: &mut Db, paths: &Paths) -> Result<()> {
         .collect();
     let current = db.current_files()?;
     refuse_busy_rollback(id, &current, &desired, paths)?;
+    Ok((state, desired, current))
+}
 
-    let marker = super::OperationMarker::start(paths, &format!("rollback to generation {id}"))?;
-    let mut record = Some(super::operations::OperationJournal::begin(
-        paths,
-        &format!("rollback to generation {id}"),
-    )?);
-    let target_digest = crate::util::sha256_bytes(&serde_json::to_vec(&state)?);
-    if let Some(journal) = record.as_mut() {
-        journal.target(&target_digest)?;
-    }
-    let (removed, linked) = match reapply_links(&target_root, &desired, &current, &mut record) {
-        Ok(counts) => counts,
-        Err(error) => {
-            // the tree was already partly rewritten; bring the links back in step
-            // with the database before reporting the failure
-            if let Err(repair) = repair_links(db, paths) {
-                if let Some(journal) = record.take() {
-                    journal.keep();
-                }
-                marker.keep();
-                return Err(error.context(format!(
-                    "rollback failed and the links could not be reconciled: {repair:#}"
-                )));
-            }
-            return Err(error);
-        }
-    };
-
-    let current_adopted: Vec<(String, String, String)> = db
+/// Every adopted backup the current packages hold.
+fn adopted_entries(db: &Db) -> Result<Vec<(String, String, String)>> {
+    Ok(db
         .packages()?
         .into_iter()
         .map(|row| {
@@ -236,8 +221,31 @@ pub fn rollback(id: i64, db: &mut Db, paths: &Paths) -> Result<()> {
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
-        .collect();
-    let current_names: Vec<String> = db.packages()?.into_iter().map(|row| row.name).collect();
+        .collect())
+}
+
+/// The generation a rollback restores, and the rows it reconciles.
+struct RestoreFiles<'a> {
+    id: i64,
+    state: &'a crate::db::State,
+    current: &'a [crate::db::FileRow],
+    current_adopted: &'a [(String, String, String)],
+}
+
+/// Records the adopted files this generation drops and rewrites the database.
+fn restore_files(
+    db: &mut Db,
+    paths: &Paths,
+    target_root: &Path,
+    input: RestoreFiles<'_>,
+    record: &mut Option<super::operations::OperationJournal>,
+) -> Result<Option<PathBuf>, (anyhow::Error, bool)> {
+    let RestoreFiles {
+        id,
+        state,
+        current,
+        current_adopted,
+    } = input;
     let kept: std::collections::HashSet<(&str, &str)> = state
         .adopted
         .iter()
@@ -252,44 +260,78 @@ pub fn rollback(id: i64, db: &mut Db, paths: &Paths) -> Result<()> {
         None
     } else {
         let path = recovery_path(paths, id);
-        match write_recovery(&path, &recovery_signature(&state)?, &to_restore) {
+        let signature = match recovery_signature(state) {
+            Ok(signature) => signature,
+            Err(error) => return Err((error, false)),
+        };
+        match write_recovery(&path, &signature, &to_restore) {
             Ok(()) => Some(path),
             Err(error) => {
                 if let Some(journal) = record.take() {
                     journal.keep();
                 }
-                marker.keep();
-                return Err(error);
+                return Err((error, true));
             }
         }
     };
 
-    if let Err(error) = db.replace_state(&state) {
+    if let Err(error) = db.replace_state(state) {
         let mut journal = record.take();
         if let Some(path) = &recovery {
             let _ = fs::remove_file(path);
         }
         // the tree already shows the older generation; point it back at the
         // records that survived the failed write, configuration paths included
-        restore_rows(&target_root, &current);
+        restore_rows(target_root, current);
         if let Err(repair) = repair_links(db, paths) {
             if let Some(journal) = journal.take() {
                 journal.keep();
             }
-            marker.keep();
-            return Err(error.context(format!(
-                "recording the generation failed and the links could not be reconciled: {repair:#}"
-            )));
+            return Err((
+                error.context(format!(
+                    "recording the generation failed and the links could not be reconciled: {repair:#}"
+                )),
+                true,
+            ));
         }
-        return Err(error);
+        return Err((error, false));
     }
-    if let Err(error) = restore_adopted(db, &target_root, &state, &current_adopted) {
+    if let Err(error) = restore_adopted(db, target_root, state, current_adopted) {
         if let Some(journal) = record.take() {
             journal.keep();
         }
-        marker.keep();
-        return Err(error.context("adopted backups were not restored"));
+        return Err((error.context("adopted backups were not restored"), true));
     }
+    Ok(recovery)
+}
+
+/// The generation row a rollback writes, plus what it changed in the tree.
+struct GenerationCommit<'a> {
+    id: i64,
+    state: &'a crate::db::State,
+    current_names: Vec<String>,
+    recovery: Option<PathBuf>,
+    removed: usize,
+    linked: usize,
+}
+
+/// Finishes a rollback whose database row is already written.
+fn commit_generation(
+    db: &mut Db,
+    paths: &Paths,
+    target_root: &Path,
+    commit: GenerationCommit<'_>,
+    record: &mut Option<super::operations::OperationJournal>,
+    marker: super::OperationMarker,
+) -> Result<()> {
+    let GenerationCommit {
+        id,
+        state,
+        current_names,
+        recovery,
+        removed,
+        linked,
+    } = commit;
     if let Some(path) = &recovery {
         let _ = fs::remove_file(path);
         if let Some(dir) = path.parent() {
@@ -297,7 +339,10 @@ pub fn rollback(id: i64, db: &mut Db, paths: &Paths) -> Result<()> {
         }
     }
     if let Some(journal) = record.take() {
-        journal.commit()?;
+        if let Err(error) = journal.commit() {
+            marker.keep();
+            return Err(error);
+        }
     }
     let target_names: std::collections::HashSet<&str> =
         state.packages.iter().map(|row| row.name.as_str()).collect();
@@ -329,7 +374,7 @@ pub fn rollback(id: i64, db: &mut Db, paths: &Paths) -> Result<()> {
     if let Err(error) = db.prune_generations(keep, &protected_generations(paths)) {
         eprintln!("warning: old generations were not pruned: {error:#}");
     }
-    for warning in run_ld_cache_hooks(&target_root) {
+    for warning in run_ld_cache_hooks(target_root) {
         eprintln!("warning: {warning}");
     }
     say!("rollback generation {id}: {linked} linked, {removed} unlinked");
@@ -340,6 +385,76 @@ pub fn rollback(id: i64, db: &mut Db, paths: &Paths) -> Result<()> {
         "unlinked": removed,
     }));
     Ok(())
+}
+
+pub fn rollback(id: i64, db: &mut Db, paths: &Paths) -> Result<()> {
+    let (state, desired, current) = validate_rollback(db, paths, id)?;
+    let target_root = paths.target_root();
+
+    let marker = super::OperationMarker::start(paths, &format!("rollback to generation {id}"))?;
+    let mut record = Some(super::operations::OperationJournal::begin(
+        paths,
+        &format!("rollback to generation {id}"),
+    )?);
+    let target_digest = crate::util::sha256_bytes(&serde_json::to_vec(&state)?);
+    if let Some(journal) = record.as_mut() {
+        journal.target(&target_digest)?;
+    }
+    let (removed, linked) = match reapply_links(&target_root, &desired, &current, &mut record) {
+        Ok(counts) => counts,
+        Err(error) => {
+            // the tree was already partly rewritten; bring the links back in step
+            // with the database before reporting the failure
+            if let Err(repair) = repair_links(db, paths) {
+                if let Some(journal) = record.take() {
+                    journal.keep();
+                }
+                marker.keep();
+                return Err(error.context(format!(
+                    "rollback failed and the links could not be reconciled: {repair:#}"
+                )));
+            }
+            return Err(error);
+        }
+    };
+
+    let current_adopted = adopted_entries(db)?;
+    let current_names: Vec<String> = db.packages()?.into_iter().map(|row| row.name).collect();
+    let recovery = match restore_files(
+        db,
+        paths,
+        &target_root,
+        RestoreFiles {
+            id,
+            state: &state,
+            current: &current,
+            current_adopted: &current_adopted,
+        },
+        &mut record,
+    ) {
+        Ok(recovery) => recovery,
+        Err((error, keep_marker)) => {
+            if keep_marker {
+                marker.keep();
+            }
+            return Err(error);
+        }
+    };
+    commit_generation(
+        db,
+        paths,
+        &target_root,
+        GenerationCommit {
+            id,
+            state: &state,
+            current_names,
+            recovery,
+            removed,
+            linked,
+        },
+        &mut record,
+        marker,
+    )
 }
 
 fn reapply_links(

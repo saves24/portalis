@@ -203,7 +203,7 @@ fn apply_directories(
     };
     let mut created = Vec::new();
     for dir in &manifest.dirs {
-        if crate::policy::is_protected_path(&dir.path) {
+        if !crate::policy::allow_protected_paths() && crate::policy::is_protected_path(&dir.path) {
             remove_directories(target_root, &created);
             bail!("refusing to create protected directory {}", dir.path);
         }
@@ -479,13 +479,8 @@ pub(super) fn apply_pending_file(
 ) -> Result<()> {
     let (path, sha, link_target, mode, kind) = entry;
     let live = live_path(target_root, &path);
-    let resolved = crate::links::resolved_live_target(target_root, &path)
-        .with_context(|| format!("resolving the parent of {path}"))?;
-    let root_canonical = std::fs::canonicalize(target_root)
-        .with_context(|| format!("resolving {}", target_root.display()))?;
-    let relative = resolved.strip_prefix(&root_canonical).unwrap_or(&resolved);
-    let protected = format!("/{}", relative.display()).replace("//", "/");
-    if crate::policy::is_protected_path(&protected) {
+    let (protected, resolved) = resolved_activation_path(target_root, &path)?;
+    if !crate::policy::allow_protected_paths() && crate::policy::is_protected_path(&protected) {
         bail!(
             "refusing to activate {path}: it resolves to protected path {}",
             resolved.display()
@@ -500,44 +495,7 @@ pub(super) fn apply_pending_file(
         )?;
     }
     if kind == "config" {
-        let store_file = PathBuf::from(&link_target);
-        crate::links::ensure_live_dir(target_root, &path)?;
-        if fs::symlink_metadata(&live).is_ok() && fs::metadata(&live).is_err() {
-            bail!(
-                "{path} is a symlink whose target does not exist; refusing to write the \
-                 packaged default through it"
-            );
-        }
-        let default_is_link = fs::symlink_metadata(&store_file)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false);
-        if default_is_link {
-            if !live.exists() && fs::symlink_metadata(&live).is_err() {
-                let target = fs::read_link(&store_file)?;
-                crate::policy::validate_link_target(
-                    target_root,
-                    &path,
-                    &target.to_string_lossy(),
-                    Some(Path::new(&pkg.store_path)),
-                )?;
-                safe_symlink(target_root, &path, &target.to_string_lossy())?;
-                say!("config   {path} (symlink created)");
-            }
-            return Ok(());
-        }
-        if fs::symlink_metadata(&live).is_err() {
-            let written = crate::links::copy_into_live(target_root, &path, &store_file, None)?;
-            say!("config   {written} (copied once)");
-        } else {
-            let live_sha = crate::util::sha256_file(&live)?;
-            let default_sha = crate::util::sha256_file(&store_file)?;
-            if live_sha != default_sha {
-                let written =
-                    crate::links::copy_into_live(target_root, &path, &store_file, Some("pacnew"))?;
-                say!("config   {path} differs, default written to {written}");
-            }
-        }
-        return Ok(());
+        return apply_config_file(pkg, target_root, &path, &link_target, &live);
     }
 
     // the store has to still hold the file before anything under the live root
@@ -550,50 +508,14 @@ pub(super) fn apply_pending_file(
         fs::set_permissions(&link_target, fs::Permissions::from_mode(mode))
             .with_context(|| format!("setting the mode of {}", link_target))?;
     }
-    let mut adopted_backup: Option<PathBuf> = None;
+    let mut backup: Option<PathBuf> = None;
     if let Ok(meta) = fs::symlink_metadata(&live) {
         if meta.file_type().is_symlink() {
-            if let Some((owner, _)) = db.pending_owner(&path)? {
-                if owner != pkg.name {
-                    bail!("refusing to replace {path}: it is staged by another package ({owner})");
-                }
-            }
-            match db.owner(&path)? {
-                Some((owner, _)) if owner == pkg.name => {}
-                Some((owner, _)) => {
-                    bail!("refusing to replace {path}: it is linked by another package ({owner})")
-                }
-                None if pkg.state == crate::db::PackageState::StagedForced => {}
-                None => bail!("refusing to replace {path}: the existing link is unowned"),
-            }
-            // safe_symlink swaps the link through a temporary name.
+            check_existing_link(db, pkg, &path)?;
         } else if pkg.state == crate::db::PackageState::StagedForced {
-            // The backup keeps the live path without its leading slash.
-            let backup_root = paths.state_dir().join("backup");
-            let backup = backup_root.join(path.trim_start_matches('/'));
-            if let Some(parent) = backup.parent() {
-                ensure_private_dir(&backup_root, parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
-            if backup.exists() {
-                // an earlier adoption already kept the original; leave the
-                // current file in place
-                say!("keep     {path} (earlier backup stays the original)");
-                *kept += 1;
-                return Ok(());
-            } else {
-                move_file(&live, &backup)?;
-                if let Err(error) = db.set_adopted(&pkg.name, &path, &backup.to_string_lossy()) {
-                    // put the file back when the ledger did not record the adoption
-                    if let Err(restore) = move_file(&backup, &live) {
-                        eprintln!(
-                            "warning: could not put {path} back: {restore}; the original stays at {}",
-                            backup.display()
-                        );
-                    }
-                    return Err(error);
-                }
-                adopted_backup = Some(backup);
+            match backup_existing(db, paths, pkg, &path, &live, kept)? {
+                Backup::Kept => return Ok(()),
+                Backup::Moved(moved) => backup = Some(moved),
             }
         } else {
             say!("skip     {path} (unmanaged file appeared, not replacing)");
@@ -601,36 +523,195 @@ pub(super) fn apply_pending_file(
             return Ok(());
         }
     }
-    if let Err(error) = safe_symlink(target_root, &path, &link_target) {
-        if let Some(backup) = adopted_backup {
-            // put the original back when the link could not be created
-            if let Err(restore) = move_file(&backup, &live) {
-                eprintln!(
-                    "warning: could not put {path} back: {restore}; the original stays at {}",
-                    backup.display()
-                );
-            }
+    if let Err(error) = link_or_copy(target_root, &path, &link_target) {
+        rollback_created(
+            db,
+            &pkg.name,
+            target_root,
+            &path,
+            &live,
+            backup.as_deref(),
+            false,
+        );
+        return Err(error);
+    }
+    if let Err(error) = record_applied(db, pkg, &path, sha, mode, &link_target) {
+        rollback_created(
+            db,
+            &pkg.name,
+            target_root,
+            &path,
+            &live,
+            backup.as_deref(),
+            true,
+        );
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The live path of a record with its parent resolved, as it will be activated.
+fn resolved_activation_path(target_root: &Path, path: &str) -> Result<(String, PathBuf)> {
+    let resolved = crate::links::resolved_live_target(target_root, path)
+        .with_context(|| format!("resolving the parent of {path}"))?;
+    let root_canonical = std::fs::canonicalize(target_root)
+        .with_context(|| format!("resolving {}", target_root.display()))?;
+    let relative = resolved.strip_prefix(&root_canonical).unwrap_or(&resolved);
+    Ok((
+        format!("/{}", relative.display()).replace("//", "/"),
+        resolved,
+    ))
+}
+
+/// Writes the packaged default of a configuration file, once.
+fn apply_config_file(
+    pkg: &crate::db::PackageRow,
+    target_root: &Path,
+    path: &str,
+    link_target: &str,
+    live: &Path,
+) -> Result<()> {
+    let store_file = PathBuf::from(link_target);
+    crate::links::ensure_live_dir(target_root, path)?;
+    if fs::symlink_metadata(live).is_ok() && fs::metadata(live).is_err() {
+        bail!(
+            "{path} is a symlink whose target does not exist; refusing to write the \
+             packaged default through it"
+        );
+    }
+    let default_is_link = fs::symlink_metadata(&store_file)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if default_is_link {
+        if !live.exists() && fs::symlink_metadata(live).is_err() {
+            let target = fs::read_link(&store_file)?;
+            crate::policy::validate_link_target(
+                target_root,
+                path,
+                &target.to_string_lossy(),
+                Some(Path::new(&pkg.store_path)),
+            )?;
+            safe_symlink(target_root, path, &target.to_string_lossy())?;
+            say!("config   {path} (symlink created)");
+        }
+        return Ok(());
+    }
+    if fs::symlink_metadata(live).is_err() {
+        let written = crate::links::copy_into_live(target_root, path, &store_file, None)?;
+        say!("config   {written} (copied once)");
+    } else {
+        let live_sha = crate::util::sha256_file(live)?;
+        let default_sha = crate::util::sha256_file(&store_file)?;
+        if live_sha != default_sha {
+            let written =
+                crate::links::copy_into_live(target_root, path, &store_file, Some("pacnew"))?;
+            say!("config   {path} differs, default written to {written}");
+        }
+    }
+    Ok(())
+}
+
+/// A live link may only be replaced when this package owns it.
+fn check_existing_link(db: &Db, pkg: &crate::db::PackageRow, path: &str) -> Result<()> {
+    if let Some((owner, _)) = db.pending_owner(path)? {
+        if owner != pkg.name {
+            bail!("refusing to replace {path}: it is staged by another package ({owner})");
+        }
+    }
+    match db.owner(path)? {
+        Some((owner, _)) if owner == pkg.name => Ok(()),
+        Some((owner, _)) => {
+            bail!("refusing to replace {path}: it is linked by another package ({owner})")
+        }
+        None if pkg.state == crate::db::PackageState::StagedForced => Ok(()),
+        None => bail!("refusing to replace {path}: the existing link is unowned"),
+    }
+}
+
+enum Backup {
+    Kept,
+    Moved(PathBuf),
+}
+
+/// Keeps the file that stood at a live path before this package replaced it.
+fn backup_existing(
+    db: &Db,
+    paths: &Paths,
+    pkg: &crate::db::PackageRow,
+    path: &str,
+    live: &Path,
+    kept: &mut usize,
+) -> Result<Backup> {
+    let backup_root = paths.state_dir().join("backup");
+    let backup = backup_root.join(path.trim_start_matches('/'));
+    if let Some(parent) = backup.parent() {
+        ensure_private_dir(&backup_root, parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if backup.exists() {
+        // an earlier adoption already kept the original; leave the current file
+        // in place
+        say!("keep     {path} (earlier backup stays the original)");
+        *kept += 1;
+        return Ok(Backup::Kept);
+    }
+    move_file(live, &backup)?;
+    if let Err(error) = db.set_adopted(&pkg.name, path, &backup.to_string_lossy()) {
+        // put the file back when the ledger did not record the adoption
+        if let Err(restore) = move_file(&backup, live) {
+            eprintln!(
+                "warning: could not put {path} back: {restore}; the original stays at {}",
+                backup.display()
+            );
         }
         return Err(error);
     }
+    Ok(Backup::Moved(backup))
+}
+
+fn link_or_copy(target_root: &Path, path: &str, link_target: &str) -> Result<()> {
+    safe_symlink(target_root, path, link_target)
+}
+
+fn record_applied(
+    db: &Db,
+    pkg: &crate::db::PackageRow,
+    path: &str,
+    sha: String,
+    mode: u32,
+    link_target: &str,
+) -> Result<()> {
     let manifest_file = crate::recipe::ManifestFile {
-        path: path.clone(),
+        path: path.to_string(),
         sha256: sha,
         mode,
         link: None,
     };
-    if let Err(error) = db.insert_file(&pkg.name, &manifest_file, &link_target) {
-        let _ = crate::links::remove_in_live(target_root, &path);
-        if let Some(backup) = adopted_backup {
-            if let Err(restore) = move_file(&backup, &live) {
-                eprintln!(
-                    "warning: could not put {path} back: {restore}; the original stays at {}",
-                    backup.display()
-                );
-            }
-            let _ = db.clear_adopted_path(&pkg.name, &path);
-        }
-        return Err(error);
+    db.insert_file(&pkg.name, &manifest_file, link_target)
+}
+
+/// Undoes what this row already changed when a later step failed.
+fn rollback_created(
+    db: &Db,
+    pkg: &str,
+    target_root: &Path,
+    path: &str,
+    live: &Path,
+    backup: Option<&Path>,
+    remove_link: bool,
+) {
+    if remove_link {
+        let _ = crate::links::remove_in_live(target_root, path);
     }
-    Ok(())
+    if let Some(backup) = backup {
+        if let Err(restore) = move_file(backup, live) {
+            eprintln!(
+                "warning: could not put {path} back: {restore}; the original stays at {}",
+                backup.display()
+            );
+        }
+        if remove_link {
+            let _ = db.clear_adopted_path(pkg, path);
+        }
+    }
 }
