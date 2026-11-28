@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bubblewrap build-essential bzip2 openssl python3 xz-utils zstd
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Unit tests
+        run: |
+          cargo test --bins --no-run > /tmp/unit-build.log 2>&1
+          test_bin=$(sed -n 's/.*(\(target\/[^)]*\)).*/\1/p' /tmp/unit-build.log | tail -1)
+          test -n "$test_bin"
+          sudo -E env \
+            PATH="$PATH" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            PORTALIS_ALLOW_SKIP_HOST_CONFIG=1 \
+            "$test_bin"
+      - name: CLI tests
+        run: |
+          cargo test --test cli --no-run > /tmp/cli-build.log 2>&1
+          test_bin=$(sed -n 's/.*(\(target\/[^)]*\)).*/\1/p' /tmp/cli-build.log | tail -1)
+          test -n "$test_bin"
+          sudo -E env \
+            PATH="$PATH" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            PORTALIS_ALLOW_SKIP_HOST_CONFIG=1 \
+            PORTALIS_ALLOW_SKIP=1 \
+            "$test_bin"
